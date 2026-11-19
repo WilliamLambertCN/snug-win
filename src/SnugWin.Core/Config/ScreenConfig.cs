@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using SnugWin.Core.PhoneScreen;
 
@@ -18,6 +18,11 @@ public sealed record ScreenConfig
 
     [JsonPropertyName("device")]
     public PhoneChoice Device { get; init; } = PhoneChoice.Standard;
+
+    [JsonPropertyName("fixedNativePixels")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    [JsonConverter(typeof(NativePixelsOptInConverter))]
+    public bool FixedNativePixels { get; init; }
 
     [JsonPropertyName("enabled")]
     public bool Enabled { get; init; } = true;
@@ -61,4 +66,18 @@ public sealed record ScreenConfig
             Name = name
         };
     }
+}
+
+// A malformed opt-in must not quarantine the user's other screen settings.
+internal sealed class NativePixelsOptInConverter : JsonConverter<bool>
+{
+    public override bool Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        bool enabled = reader.TokenType == JsonTokenType.True;
+        reader.Skip();
+        return enabled;
+    }
+
+    public override void Write(Utf8JsonWriter writer, bool value, JsonSerializerOptions options) =>
+        writer.WriteBooleanValue(value);
 }

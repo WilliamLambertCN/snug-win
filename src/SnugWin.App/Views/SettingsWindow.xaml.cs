@@ -103,44 +103,8 @@ public partial class SettingsWindow : Window
         _suppressEvents = true;
         try
         {
-            VersionBadgeText.Text = $"v{_controller.CurrentVersion}";
-            string pkgLabel = _controller.PackageKind == ReleasePackageKind.SelfContained ? "自包含版" : "框架依赖版";
-            AboutVersionText.Text = $"当前版本：v{_controller.CurrentVersion}（{pkgLabel}）";
-
-            StatusText.Text = _controller.GetStatusSummary();
-            StatusIndicatorDot.Fill = _controller.IsPhoneScreenReady
-                ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x34, 0xD3, 0x99))
-                : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x60, 0xA5, 0xFA));
-
-            bool pipeOk = _controller.IsDriverPipeAvailable;
-            DiagPipeText.Text = pipeOk
-                ? @"已连接命名管道 \\.\pipe\virtualdisplaydriver"
-                : @"未检测到命名管道 \\.\pipe\virtualdisplaydriver";
-
-            DiagAlertDot.Visibility = pipeOk ? Visibility.Collapsed : Visibility.Visible;
-
-            if (!pipeOk)
-            {
-                DriverWarningText.Text = _controller.BundledDriverInstallerScript is not null
-                    ? "已内置 virtual-display-rs 0.3.1，点击右侧一键校验安装"
-                    : "请安装或重启 virtual-display-rs 0.3.1 虚拟显示器驱动";
-                if (InstallDriverBtn.IsEnabled)
-                    InstallDriverBtn.Content = _controller.BundledDriverInstallerScript is not null ? "一键安装" : "下载驱动";
-                DriverWarningBanner.Visibility = Visibility.Visible;
-                StatusHeroCard.Visibility = Visibility.Collapsed;
-            }
-            else
-            {
-                DriverWarningBanner.Visibility = Visibility.Collapsed;
-                StatusHeroCard.Visibility = Visibility.Visible;
-            }
-
-            ElevationText.Text = _controller.IsElevated ? "管理员权限运行中" : "普通用户权限";
-            ElevateBtn.Visibility = _controller.IsElevated ? Visibility.Collapsed : Visibility.Visible;
-            HeroReentryBtn.Visibility = _controller.CanReenterPhoneScreen ? Visibility.Visible : Visibility.Collapsed;
-            HeroReadyBadge.Visibility = !_controller.CanReenterPhoneScreen && _controller.IsElevated
-                ? Visibility.Visible
-                : Visibility.Collapsed;
+            RefreshStatus();
+            RefreshDriverStatus();
 
             var cfg = _controller.Config;
             PhoneScreenCheck.IsChecked = cfg.PhoneScreen;
@@ -158,24 +122,8 @@ public partial class SettingsWindow : Window
             ManualPhoneCheck.IsChecked = _controller.ManualOverride;
             AutoCheckUpdatesCheck.IsChecked = cfg.AutoCheckUpdates;
 
-            var primaryCfg = _controller.GetScreenConfig(_controller.PrimaryTouchScreenId);
-            var primaryDevice = primaryCfg?.Device ?? cfg.Phone;
-            var primaryOrient = primaryCfg?.Orientation ?? SnugWin.Core.PhoneScreen.ScreenOrientation.Portrait;
-            PhoneModelText.Text = primaryDevice.Model ?? "自定义比例";
-            var fit = ScreenFit.FromDevice(primaryDevice.Screen, primaryDevice.Kind, primaryOrient);
-            var (pxW, pxH) = fit.PixelSize(fit.BaseWidth);
-            PhoneSpecText.Text = $"{pxW} × {pxH} · {fit.TargetDpiPercent(fit.BaseWidth)}%";
-            double ratio = (double)pxW / Math.Max(1, pxH);
-            if (ratio >= 1.0)
-            {
-                PhoneFrameOutline.Width = 28;
-                PhoneFrameOutline.Height = Math.Clamp(Math.Round(28 / ratio), 14, 28);
-            }
-            else
-            {
-                PhoneFrameOutline.Height = 34;
-                PhoneFrameOutline.Width = Math.Clamp(Math.Round(34 * ratio), 14, 28);
-            }
+            RefreshPrimaryScreen(_controller.GetScreenConfig(_controller.PrimaryTouchScreenId)
+                ?? new ScreenConfig { Device = cfg.Phone });
 
             var screens = _controller.ConfiguredScreens;
             int enabledCount = 0;
@@ -199,6 +147,59 @@ public partial class SettingsWindow : Window
         finally
         {
             _suppressEvents = false;
+        }
+    }
+
+    private void RefreshStatus()
+    {
+        VersionBadgeText.Text = $"v{_controller.CurrentVersion}";
+        string pkgLabel = _controller.PackageKind == ReleasePackageKind.SelfContained ? "自包含版" : "框架依赖版";
+        AboutVersionText.Text = $"当前版本：v{_controller.CurrentVersion}（{pkgLabel}）";
+        StatusText.Text = _controller.GetStatusSummary();
+        StatusIndicatorDot.Fill = _controller.IsPhoneScreenReady
+            ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x34, 0xD3, 0x99))
+            : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x60, 0xA5, 0xFA));
+        ElevationText.Text = _controller.IsElevated ? "管理员权限运行中" : "普通用户权限";
+        ElevateBtn.Visibility = _controller.IsElevated ? Visibility.Collapsed : Visibility.Visible;
+        HeroReentryBtn.Visibility = _controller.CanReenterPhoneScreen ? Visibility.Visible : Visibility.Collapsed;
+        HeroReadyBadge.Visibility = !_controller.CanReenterPhoneScreen && _controller.IsElevated
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+    }
+
+    private void RefreshDriverStatus()
+    {
+        bool pipeOk = _controller.IsDriverPipeAvailable;
+        DiagPipeText.Text = pipeOk
+            ? @"已连接命名管道 \\.\pipe\virtualdisplaydriver"
+            : @"未检测到命名管道 \\.\pipe\virtualdisplaydriver";
+        DiagAlertDot.Visibility = pipeOk ? Visibility.Collapsed : Visibility.Visible;
+        DriverWarningBanner.Visibility = pipeOk ? Visibility.Collapsed : Visibility.Visible;
+        StatusHeroCard.Visibility = pipeOk ? Visibility.Visible : Visibility.Collapsed;
+        if (pipeOk) return;
+        bool bundled = _controller.BundledDriverInstallerScript is not null;
+        DriverWarningText.Text = bundled
+            ? "已内置 virtual-display-rs 0.3.1，点击右侧一键校验安装"
+            : "请安装或重启 virtual-display-rs 0.3.1 虚拟显示器驱动";
+        if (InstallDriverBtn.IsEnabled) InstallDriverBtn.Content = bundled ? "一键安装" : "下载驱动";
+    }
+
+    private void RefreshPrimaryScreen(ScreenConfig screen)
+    {
+        PhoneModelText.Text = screen.Device.Model ?? "自定义比例";
+        var fit = ScreenPlan.FitOf(screen);
+        var (pxW, pxH) = fit.PixelSize(fit.BaseWidth);
+        PhoneSpecText.Text = $"{pxW} × {pxH} · {fit.TargetDpiPercent(fit.BaseWidth)}%";
+        double ratio = (double)pxW / Math.Max(1, pxH);
+        if (ratio >= 1.0)
+        {
+            PhoneFrameOutline.Width = 28;
+            PhoneFrameOutline.Height = Math.Clamp(Math.Round(28 / ratio), 14, 28);
+        }
+        else
+        {
+            PhoneFrameOutline.Height = 34;
+            PhoneFrameOutline.Width = Math.Clamp(Math.Round(34 * ratio), 14, 28);
         }
     }
 
@@ -315,17 +316,11 @@ public partial class SettingsWindow : Window
         {
             var state = _controller.GetScreenState(s.Id);
             string kindLabel = s.Device.Kind.DisplayName();
-            string orientLabel = s.Orientation == SnugWin.Core.PhoneScreen.ScreenOrientation.Landscape ? "横屏" : "竖屏";
-            var fit = ScreenFit.FromDevice(s.Device.Screen, s.Device.Kind, s.Orientation);
+            string orientLabel = s.Orientation.DisplayName();
+            var fit = ScreenPlan.FitOf(s);
             var (pxW, pxH) = fit.PixelSize(fit.BaseWidth);
             string summary = $"{s.Device.Model ?? "自定义"} · {pxW} × {pxH}";
-            string status = state.ScreenPhase switch
-            {
-                PhoneScreenPhase.Ready => "已连接",
-                PhoneScreenPhase.Preparing => "创建中",
-                PhoneScreenPhase.Failed => "异常",
-                _ => s.Enabled ? "待命" : "已停用"
-            };
+            string status = ScreenStatusLabel(state.ScreenPhase, s.Enabled);
             rows.Add(new ScreenRowItem(
                 Id: s.Id,
                 Name: s.Name,
@@ -345,6 +340,14 @@ public partial class SettingsWindow : Window
         AddScreenFullText.Visibility = canAdd ? Visibility.Collapsed : Visibility.Visible;
         UpdateAddOrientationAvailability();
     }
+
+    private static string ScreenStatusLabel(PhoneScreenPhase phase, bool enabled) => phase switch
+    {
+        PhoneScreenPhase.Ready => "已连接",
+        PhoneScreenPhase.Preparing => "创建中",
+        PhoneScreenPhase.Failed => "异常",
+        _ => enabled ? "待命" : "已停用"
+    };
 
     private DeviceKind SelectedAddKind()
     {

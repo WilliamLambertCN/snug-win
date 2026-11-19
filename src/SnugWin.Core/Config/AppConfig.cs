@@ -52,29 +52,9 @@ public sealed record AppConfig
 
     public AppConfig Sanitize()
     {
-        var phone = Phone.Screen.IsValid ? Phone : PhoneChoice.Standard;
+        var phone = Phone is { Screen.IsValid: true } ? Phone : PhoneChoice.Standard;
         var theme = Enum.IsDefined(Theme) ? Theme : AppThemeMode.Light;
-
-        IReadOnlyList<ScreenConfig>? sanitizedScreens = null;
-        if (Screens is not null)
-        {
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var list = new List<ScreenConfig>();
-            foreach (var raw in Screens)
-            {
-                if (raw is null || !raw.Device.Screen.IsValid) continue;
-                var clean = raw.Sanitize();
-                if (!seen.Add(clean.Id)) continue;
-                list.Add(clean);
-                if (list.Count >= ScreenConfig.Limit) break;
-            }
-            sanitizedScreens = list;
-        }
-        else
-        {
-            sanitizedScreens = [ScreenConfig.LegacyPhone(phone, PhoneScreen)];
-        }
-
+        var sanitizedScreens = SanitizeScreens(phone);
         var legacyPhone = sanitizedScreens.FirstOrDefault(s =>
             s.Orientation == ScreenOrientation.Portrait && s.Device.Kind == DeviceKind.Phone);
 
@@ -86,6 +66,22 @@ public sealed record AppConfig
             PhoneScreen = legacyPhone?.Enabled ?? sanitizedScreens.Any(s => s.Enabled),
             Screens = sanitizedScreens
         };
+    }
+
+    private IReadOnlyList<ScreenConfig> SanitizeScreens(PhoneChoice phone)
+    {
+        if (Screens is null) return [ScreenConfig.LegacyPhone(phone, PhoneScreen)];
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var list = new List<ScreenConfig>();
+        foreach (var raw in Screens)
+        {
+            if (raw is not { Device.Screen.IsValid: true }) continue;
+            var clean = raw.Sanitize();
+            if (!seen.Add(clean.Id)) continue;
+            list.Add(clean);
+            if (list.Count >= ScreenConfig.Limit) break;
+        }
+        return list;
     }
 
     public AppConfig WithScreenAdded(ScreenOrientation orientation, PhoneChoice device, string? name = null)

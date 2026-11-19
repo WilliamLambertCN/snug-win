@@ -278,7 +278,8 @@ public partial class PhoneHomeWindow : Window
         PhoneRootGrid.Width = designW;
         PhoneRootGrid.Height = designH;
         PhoneRootGrid.LayoutTransform = new ScaleTransform(scale, scale);
-        Title = $"SnugWin 预览 — {phone.Model ?? "自定义"} ({phone.Screen.Width} × {phone.Screen.Height})";
+        var (pxW, pxH) = fit.PixelSize(fit.BaseWidth);
+        Title = $"SnugWin 预览 — {phone.Model ?? "自定义"} ({pxW} × {pxH})";
         UpdateResponsiveLayout();
     }
 

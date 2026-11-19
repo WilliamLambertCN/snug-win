@@ -27,7 +27,9 @@ public static class ScreenPlan
         kind.IsTouch() ? ScreenBehavior.TouchScreen : ScreenBehavior.Computer;
 
     public static ScreenFit FitOf(ScreenConfig screen) =>
-        ScreenFit.FromDevice(screen.Device.Screen, screen.Device.Kind, screen.Orientation);
+        screen is { FixedNativePixels: true, Device.Kind: DeviceKind.Phone, Orientation: ScreenOrientation.Portrait }
+            ? ScreenFit.FromNativePhone(screen.Device.Screen)
+            : ScreenFit.FromDevice(screen.Device.Screen, screen.Device.Kind, screen.Orientation);
 
     public static IReadOnlyList<ScreenWish> Wishes(AppConfig config, bool remote, bool preview = false)
     {

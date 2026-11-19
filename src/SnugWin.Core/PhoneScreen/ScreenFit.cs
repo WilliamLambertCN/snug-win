@@ -29,6 +29,8 @@ public sealed record ScreenFit : IEquatable<ScreenFit>
     private const double TabletScale = 1.24;
     private const double BaseHomeBarHeight = 28.0;
 
+    private readonly (int Width, int Height)? _nativePixels;
+
     public double Ratio { get; }
     public int BaseWidth { get; }
     public IReadOnlyList<int> Widths { get; }
@@ -91,6 +93,25 @@ public sealed record ScreenFit : IEquatable<ScreenFit>
         Widths = list;
     }
 
+    private ScreenFit(int pixelWidth, int pixelHeight)
+    {
+        Kind = DeviceKind.Phone;
+        Orientation = ScreenOrientation.Portrait;
+        _nativePixels = (pixelWidth, pixelHeight);
+        Ratio = (double)pixelHeight / pixelWidth;
+        BaseWidth = pixelWidth / 2;
+        Widths = [BaseWidth];
+    }
+
+    internal static ScreenFit FromNativePhone(PhoneScreenSpecData? phone)
+    {
+        if (phone is not { IsValid: true }) return Standard;
+        bool usable = phone.Width >= 480 && phone.Width <= MaxPixels.Width
+            && phone.Height >= 800 && phone.Height <= MaxPixels.Height
+            && phone.Height <= 3 * phone.Width && phone.Width % 2 == 0 && phone.Height % 2 == 0;
+        return usable ? new ScreenFit(phone.Width, phone.Height) : FromPhone(phone);
+    }
+
     public static ScreenFit FromPhone(PhoneScreenSpecData phone) =>
         FromDevice(phone, DeviceKind.Phone, ScreenOrientation.Portrait);
 
@@ -139,15 +160,14 @@ public sealed record ScreenFit : IEquatable<ScreenFit>
         return new ScreenFit(ratio, orientation, DeviceKind.Tablet, wantedWidth);
     }
 
-    public SizeD Size(int width) =>
-        new(width, Math.Round(width * Ratio, MidpointRounding.AwayFromZero));
+    public SizeD Size(int width) => _nativePixels is { } pixels
+        ? new(pixels.Width / 2, pixels.Height / 2)
+        : new(width, Math.Round(width * Ratio, MidpointRounding.AwayFromZero));
 
-    /// <summary>
-    /// Physical pixel resolution for virtual-display-rs mode registration.
-    /// Uses 2x pixels (200% DPI) for touch displays &amp; HiDPI computer displays, falling back to 1x when > 2K.
-    /// </summary>
+    /// <summary>Physical pixels to register: the exact fixed mode, or the adaptive mode at the requested width.</summary>
     public (int PixelWidth, int PixelHeight) PixelSize(int logicalWidth)
     {
+        if (_nativePixels is { } pixels) return pixels;
         var logical = Size(logicalWidth);
         int multiplier = (Kind == DeviceKind.Computer && (logical.Width * 2 > 3840 || logical.Height * 2 > 2400)) ? 1 : 2;
         int pw = (int)logical.Width * multiplier;
@@ -165,6 +185,7 @@ public sealed record ScreenFit : IEquatable<ScreenFit>
 
     public int WidthToFit(SizeD window, SizeD area, int currentWidth)
     {
+        if (_nativePixels.HasValue) return BaseWidth;
         const double tolerance = 2.0;
         if (window.Width <= area.Width + tolerance && window.Height <= area.Height + tolerance)
             return currentWidth;
@@ -196,7 +217,7 @@ public sealed record ScreenFit : IEquatable<ScreenFit>
         double maxW = Math.Max(300.0, workAreaDip.Width * 0.72);
         double maxH = Math.Max(420.0, workAreaDip.Height * 0.84 - 48.0);
         double scale = Math.Min(0.84, Math.Min(maxW / logical.Width, maxH / logical.Height));
-        scale = Math.Max(0.35, scale);
+        if (fit._nativePixels is null) scale = Math.Max(0.35, scale);
         return (logical.Width, logical.Height, scale);
     }
 
@@ -205,9 +226,10 @@ public sealed record ScreenFit : IEquatable<ScreenFit>
         && Ratio.Equals(other.Ratio)
         && BaseWidth == other.BaseWidth
         && Orientation == other.Orientation
-        && Kind == other.Kind;
+        && Kind == other.Kind
+        && _nativePixels == other._nativePixels;
 
-    public override int GetHashCode() => HashCode.Combine(Ratio, BaseWidth, Orientation, Kind);
+    public override int GetHashCode() => HashCode.Combine(Ratio, BaseWidth, Orientation, Kind, _nativePixels);
 
     public override string ToString()
     {
