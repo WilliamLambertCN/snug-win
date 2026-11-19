@@ -209,9 +209,9 @@ public sealed class AppController : ILogSink
         if (_shuttingDown || System.Threading.Interlocked.Exchange(ref _sampling, 1) == 1) return;
         try
         {
-            var now = DateTimeOffset.Now;
             _screenshots.Expire();
-            var signals = await Task.Run(() => _sensor.Sample(now));
+            bool wasConnected = _session.IsConnected;
+            var (signals, now) = await Task.Run(() => _sensor.Sample(wasConnected));
             if (_shuttingDown) return;
 
             var transitions = _session.Update(signals, now);
@@ -230,12 +230,7 @@ public sealed class AppController : ILogSink
                 _desks.SettleDisplays();
             }
 
-            bool showAnyList = _desks.Wishes.Any(w =>
-                w.IsTouch
-                && _desks.StateOf(w.Id) is { ScreenPhase: PhoneScreenPhase.Ready } dst
-                && (dst.ListVisible || dst.Placed is null)
-                && dst.Work is null);
-            if (showAnyList && (now - _lastCatalogRefresh).TotalSeconds >= 1.5)
+            if (ShouldRefreshRunningApps(now))
             {
                 _lastCatalogRefresh = now;
                 await RefreshRunningAppsAsync();
@@ -251,6 +246,13 @@ public sealed class AppController : ILogSink
             System.Threading.Interlocked.Exchange(ref _sampling, 0);
         }
     }
+
+    private bool ShouldRefreshRunningApps(DateTimeOffset now) =>
+        (now - _lastCatalogRefresh).TotalSeconds >= 1.5 && _desks.Wishes.Any(w =>
+            w.IsTouch
+            && _desks.StateOf(w.Id) is { ScreenPhase: PhoneScreenPhase.Ready } dst
+            && (dst.ListVisible || dst.Placed is null)
+            && dst.Work is null);
 
     public void RefreshRunningApps() => _ = RefreshRunningAppsAsync();
 

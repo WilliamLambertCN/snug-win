@@ -20,32 +20,35 @@ namespace SnugWin.Windows.Sensing;
 /// </summary>
 public sealed class UUSensor
 {
+    private readonly ControllerTableProbe _controllers = new(ReadControllers);
     private readonly StreamLogActivityTracker _streamLog = new();
-    private int _lastServerPid;
+    private readonly HashSet<string> _logFiles = new(StringComparer.OrdinalIgnoreCase);
+    private int? _lastServerPid;
     private string? _resolvedLogDir;
     private bool _loggedLogReadError;
 
     public bool ManualOverride { get; set; }
     public bool LastPeerTcpObserved { get; private set; }
 
-    public UUSignals Sample(DateTimeOffset now)
+    public (UUSignals Signals, DateTimeOffset ObservedAt) Sample(bool wasConnected)
     {
         if (ManualOverride)
         {
-            return new UUSignals(
+            var manual = new UUSignals(
                 OverlayVisible: true,
                 Controllers: ControllerTable.FromNames("手动开启 (Phone)"),
                 CaptureActive: true);
+            return (manual, DateTimeOffset.Now);
         }
 
         int? serverPid = FindProcessPid("GameViewerServer");
         int? clientPid = FindProcessPid("GameViewer");
-
         bool overlayVisible = serverPid is { } sp && HasVisibleWindow(sp);
-        var controllers = clientPid is { } cp ? ReadControllers(cp) : ControllerTable.Unreadable;
-        bool? captureActive = SampleCaptureActive(serverPid, now);
-
-        return new UUSignals(overlayVisible, controllers, captureActive);
+        long? bytes = ReadStreamLogBytes(serverPid);
+        var observedAt = DateTimeOffset.Now;
+        bool? active = _streamLog.Observe(serverPid, bytes, bytes.HasValue, observedAt, wasConnected);
+        var controllers = _controllers.Poll(clientPid, observedAt);
+        return (new UUSignals(overlayVisible, controllers, active), observedAt);
     }
 
     private static int? FindProcessPid(string processName)
@@ -95,40 +98,25 @@ public sealed class UUSensor
         return UiaHelper.ReadGameViewerControllers(hwnds);
     }
 
-    private bool? SampleCaptureActive(int? serverPid, DateTimeOffset now)
+    private long? ReadStreamLogBytes(int? serverPid)
     {
-        if (serverPid is not { } pid)
+        if (serverPid != _lastServerPid)
         {
-            _lastServerPid = 0;
+            _lastServerPid = serverPid;
             _resolvedLogDir = null;
-            LastPeerTcpObserved = false;
-            return _streamLog.Observe(null, null, false, now);
-        }
-
-        if (pid != _lastServerPid)
-        {
-            _lastServerPid = pid;
-            _resolvedLogDir = ResolveServerLogDir(pid);
             _loggedLogReadError = false;
         }
 
-        // TCP peer connections are recorded for diagnostics only; never treat lingering control/keepalive sockets as active streaming.
-        LastPeerTcpObserved = HasActivePeerTcpConnection(pid);
-
+        // Lingering control sockets are diagnostic context only, not evidence of streaming.
+        LastPeerTcpObserved = serverPid is { } sp && HasActivePeerTcpConnection(sp);
+        if (serverPid is not { } pid) return null;
         string? logDir = _resolvedLogDir ??= ResolveServerLogDir(pid);
-        if (string.IsNullOrEmpty(logDir) || !Directory.Exists(logDir))
-            return _streamLog.Observe(pid, null, false, now);
+        if (logDir is null || !Directory.Exists(logDir)) return null;
 
         try
         {
-            var files = Directory.EnumerateFiles(logDir, $"streamer_log_controlled_*_{pid}.slog")
-                .Select(p => new FileInfo(p))
-                .ToList();
-            if (files.Count == 0)
-                return _streamLog.Observe(pid, null, false, now);
-
-            long totalBytes = files.Sum(f => f.Length);
-            return _streamLog.Observe(pid, totalBytes, true, now);
+            var files = new DirectoryInfo(logDir).GetFiles($"streamer_log_controlled_*_{pid}.slog");
+            return MeasureLogFiles(files);
         }
         catch (Exception ex)
         {
@@ -137,8 +125,21 @@ public sealed class UUSensor
                 _loggedLogReadError = true;
                 Log.Warn($"读取 UU 推流日志目录失败（{logDir}）：{ex.Message}");
             }
-            return _streamLog.Observe(pid, null, false, now);
+            return null;
         }
+    }
+
+    private long? MeasureLogFiles(FileInfo[] files)
+    {
+        var names = files.Select(f => f.Name);
+        if (!_logFiles.SetEquals(names))
+        {
+            // The aggregate can grow even when an old file was replaced by a different, larger one.
+            _streamLog.Reset();
+            _logFiles.Clear();
+            _logFiles.UnionWith(names);
+        }
+        return files.Length == 0 ? null : files.Sum(f => f.Length);
     }
 
     private static string? ResolveServerLogDir(int serverPid)

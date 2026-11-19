@@ -633,7 +633,8 @@ public sealed class PhoneDesk
         {
             await _timeline.SleepAsync(delay, cts.Token);
             if (cts.IsCancellationRequested) return;
-            await _lane.Run(ReconcileAsync);
+            // A reshape can invalidate the retry while it waits on the shared lane.
+            await _lane.Run(() => cts.IsCancellationRequested ? Task.CompletedTask : ReconcileAsync());
         });
     }
 
@@ -710,13 +711,13 @@ public sealed class PhoneDesk
         if (offline)
         {
             await SettleAsync(pending.Before, "撤屏", pending.Permanently);
+            Log.Info($"已撤掉手机屏 #{d.Id}");
         }
         else
         {
             _retiring = pending;
             Log.Info($"手机屏 #{d.Id} 尚未下线，稍后自动善后");
         }
-        Log.Info($"已撤掉手机屏 #{d.Id}");
     }
 
     private async Task<Surroundings> CaptureSurroundingsAsync(string beforeWhat)
@@ -752,8 +753,7 @@ public sealed class PhoneDesk
     {
         if (!await _displays.ReshapeAsync(id, Fit))
         {
-            Log.Warn($"手机屏 #{id} 没能换成新比例（{Fit}），下次加屏时按新的建");
-            State = State with { Notice = new DeskNotice.ReshapeFailed() };
+            await HandleReshapeFailureAsync(id);
             return;
         }
         State = State with { Notice = new DeskNotice.Reshaped() };
@@ -766,6 +766,34 @@ public sealed class PhoneDesk
             await FillAsync(p, id);
         }
         SetPlacement(p);
+    }
+
+    private async Task HandleReshapeFailureAsync(uint id)
+    {
+        var notice = new DeskNotice.ReshapeFailed();
+        if (_displays.IsOnline(id))
+        {
+            Log.Warn($"手机屏 #{id} 没能换成新比例（{Fit}），下次加屏时按新的建");
+            State = State with { Notice = notice };
+            return;
+        }
+
+        Log.Warn($"手机屏 #{id} 换比例失败，原屏已不在线，重新启用时再建");
+        CancelRetry();
+        var record = _placement?.Record;
+        _display = null;
+        _placement = null;
+        _replaced = null;
+        State = State with
+        {
+            ScreenPhase = PhoneScreenPhase.Failed,
+            DisplayId = null,
+            Placed = null,
+            CloseButton = null,
+            ListVisible = true,
+            Notice = notice
+        };
+        if (record is not null) await RecoverRecordAsync(record);
     }
 
     private async Task RecheckAsync()
@@ -1236,16 +1264,20 @@ public sealed class PhoneDesk
         return null;
     }
 
-    private async Task<PhoneRecord?> PutBackLeftoverAsync()
+    private Task<PhoneRecord?> PutBackLeftoverAsync() =>
+        _placement is null && _ledger.Pending() is { } record
+            ? RecoverRecordAsync(record)
+            : Task.FromResult<PhoneRecord?>(null);
+
+    private async Task<PhoneRecord?> RecoverRecordAsync(PhoneRecord record)
     {
-        if (_placement is not null || _ledger.Pending() is not { } record) return null;
         if (!await _windows.ExistsAsync(record.Window))
         {
             Log.Info($"还原记录里的 {record.Label} 已经不在了，等它回来再还");
             await LeaveBehindAsync(record);
             return null;
         }
-        Log.Info($"{record.Label} 上次没放回去，现在放回 {record.Original.Short}");
+        Log.Info($"按还原记录把 {record.Label} 放回 {record.Original.Short}");
         return await PutBackAsync(record);
     }
 

@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.InteropServices;
 using SnugWin.Core.PhoneScreen;
 using SnugWin.Core.Support;
@@ -20,80 +17,97 @@ public sealed record MonitorSnapshot(
     bool IsPrimary,
     DisplayModeInfo Mode,
     AdapterLuid AdapterId,
-    uint SourceId);
+    uint SourceId)
+{
+    internal CherryMonitor? Cherry { get; init; }
+    internal string AdapterHardwareId { get; init; } = string.Empty;
+    internal bool HasDedicatedTarget { get; init; }
+    internal DpiScaleRange? DpiRange { get; init; }
+
+    public int? ResolveDpiScalePercent(int requestedPercent) => DpiRange?.NearestPercent(requestedPercent);
+}
+
+internal sealed class DpiScaleRange
+{
+    private static readonly int[] Levels = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+    private readonly int _minimumRelative;
+    private readonly int _maximumIndex;
+
+    private DpiScaleRange(int minimumRelative, int maximumIndex) => (_minimumRelative, _maximumIndex) = (minimumRelative, maximumIndex);
+
+    public static DpiScaleRange? FromRelative(int min, int max) =>
+        min <= 0 && max >= 0 && (long)max - min < Levels.Length ? new(min, max - min) : null;
+
+    public int? PercentAt(int relative)
+    {
+        long index = (long)relative - _minimumRelative;
+        return index >= 0 && index <= _maximumIndex ? Levels[(int)index] : null;
+    }
+
+    public int? RelativeFor(int percent)
+    {
+        int index = Array.IndexOf(Levels, percent);
+        return index >= 0 && index <= _maximumIndex ? _minimumRelative + index : null;
+    }
+
+    public int NearestPercent(int requested) => Levels.Take(_maximumIndex + 1).MinBy(p => Math.Abs((long)p - requested));
+}
 
 public static unsafe class DisplayConfigService
 {
-    private static readonly int[] DpiScaleTable = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
 
     public static IReadOnlyList<MonitorSnapshot> GetActiveMonitors()
     {
-        var ccdSources = QueryCcdSources();
-        var deviceStrings = QueryDeviceStrings();
+        var sources = CcdTopology.Query(Win32.QDC_ONLY_ACTIVE_PATHS)?.ActiveSources() ?? [];
+        var adapters = QueryAdapters();
         var results = new List<MonitorSnapshot>();
-
-        var handle = GCHandle.Alloc(results);
-        try
+        Win32.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr h, IntPtr _, ref Win32.RECT _, IntPtr _) =>
         {
-            Win32.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr hMonitor, IntPtr _, ref Win32.RECT _, IntPtr data) =>
-            {
-                var list = (List<MonitorSnapshot>)GCHandle.FromIntPtr(data).Target!;
-                var mi = new Win32.MONITORINFOEX { cbSize = (uint)Marshal.SizeOf<Win32.MONITORINFOEX>() };
-                if (!Win32.GetMonitorInfoW(hMonitor, ref mi)) return true;
-
-                string devName = new string(mi.szDevice).TrimEnd('\0');
-                var bounds = new RectD(mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Width, mi.rcMonitor.Height);
-                var work = new RectD(mi.rcWork.Left, mi.rcWork.Top, mi.rcWork.Width, mi.rcWork.Height);
-                bool primary = (mi.dwFlags & Win32.MONITORINFOF_PRIMARY) != 0;
-
-                var dm = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
-                int width = (int)bounds.Width;
-                int height = (int)bounds.Height;
-                double hz = 60.0;
-                if (Win32.EnumDisplaySettingsExW(devName, Win32.ENUM_CURRENT_SETTINGS, ref dm, 0))
-                {
-                    width = (int)dm.dmPelsWidth;
-                    height = (int)dm.dmPelsHeight;
-                    if (dm.dmDisplayFrequency > 0) hz = dm.dmDisplayFrequency;
-                }
-
-                ccdSources.TryGetValue(devName, out var ccd);
-                var adapterLuid = new AdapterLuid(ccd.AdapterId.LowPart, ccd.AdapterId.HighPart);
-                int dpi = ccd.Found ? GetDpiScalePercent(adapterLuid, ccd.SourceId) : 100;
-                string friendly = ccd.Found && !string.IsNullOrWhiteSpace(ccd.FriendlyName)
-                    ? ccd.FriendlyName
-                    : devName;
-                deviceStrings.TryGetValue(devName, out var devStr);
-
-                uint stableId = ComputeStableId(devName, ccd.AdapterId, ccd.SourceId);
-                list.Add(new MonitorSnapshot(
-                    stableId,
-                    devName,
-                    friendly,
-                    devStr ?? string.Empty,
-                    bounds,
-                    work,
-                    primary,
-                    new DisplayModeInfo(width, height, hz, dpi),
-                    adapterLuid,
-                    ccd.SourceId));
-                return true;
-            }, GCHandle.ToIntPtr(handle));
-        }
-        finally
-        {
-            handle.Free();
-        }
-
+            var mi = new Win32.MONITORINFOEX { cbSize = (uint)Marshal.SizeOf<Win32.MONITORINFOEX>() };
+            if (!Win32.GetMonitorInfoW(h, ref mi)) return true;
+            string name = new string(mi.szDevice);
+            var source = sources.GetValueOrDefault(name) ?? new CcdSource(default, 0, name, string.Empty);
+            if (!adapters.TryGetValue(name, out var adapter)) adapter = (string.Empty, string.Empty);
+            results.Add(Snapshot(mi, name, source, adapter));
+            return true;
+        }, IntPtr.Zero);
         return results;
+    }
+
+    private static MonitorSnapshot Snapshot(Win32.MONITORINFOEX mi, string name, CcdSource source, (string Desc, string Id) adapter)
+    {
+        var bounds = new RectD(mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Width, mi.rcMonitor.Height);
+        var work = new RectD(mi.rcWork.Left, mi.rcWork.Top, mi.rcWork.Width, mi.rcWork.Height);
+        var luid = new AdapterLuid(source.Adapter.LowPart, source.Adapter.HighPart);
+        bool dedicated = source.TargetPath.Length != 0;
+        var dpi = dedicated ? ReadDpiScale(luid, source.Id) : null;
+        var mode = CurrentMode(name, dpi?.Current ?? 100);
+        uint stableId = dedicated ? (uint)HashCode.Combine(luid, source.Id, StringComparer.OrdinalIgnoreCase.GetHashCode(source.TargetPath))
+            : (uint)StringComparer.OrdinalIgnoreCase.GetHashCode(name);
+        return new(stableId, name, string.IsNullOrEmpty(source.FriendlyName) ? name : source.FriendlyName,
+            adapter.Desc, bounds, work, (mi.dwFlags & Win32.MONITORINFOF_PRIMARY) != 0,
+            mode ?? new((int)bounds.Width, (int)bounds.Height, 60, 100), luid, source.Id)
+        {
+            AdapterHardwareId = adapter.Id,
+            DpiRange = dpi?.Range,
+            HasDedicatedTarget = dedicated && mode is not null,
+            Cherry = dpi.HasValue && adapter.Id.Equals(CherryMonitorIdentity.AdapterHardwareId, StringComparison.OrdinalIgnoreCase)
+                ? CherryMonitorIdentity.FromInterface(source.TargetPath) : null
+        };
+    }
+
+    private static DisplayModeInfo? CurrentMode(string name, int dpi)
+    {
+        var dm = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
+        return Win32.EnumDisplaySettingsExW(name, Win32.ENUM_CURRENT_SETTINGS, ref dm, 0)
+            ? new((int)dm.dmPelsWidth, (int)dm.dmPelsHeight, dm.dmDisplayFrequency > 0 ? dm.dmDisplayFrequency : 60, dpi)
+            : null;
     }
 
     public static bool SetResolution(string deviceName, int pixelWidth, int pixelHeight, double refreshRate = 60)
     {
         var dm = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
-        if (!Win32.EnumDisplaySettingsExW(deviceName, Win32.ENUM_CURRENT_SETTINGS, ref dm, 0))
-            return false;
-
+        if (!Win32.EnumDisplaySettingsExW(deviceName, Win32.ENUM_CURRENT_SETTINGS, ref dm, 0)) return false;
         dm.dmPelsWidth = (uint)pixelWidth;
         dm.dmPelsHeight = (uint)pixelHeight;
         dm.dmFields = Win32.DM_PELSWIDTH | Win32.DM_PELSHEIGHT;
@@ -102,65 +116,14 @@ public static unsafe class DisplayConfigService
             dm.dmDisplayFrequency = (uint)Math.Round(refreshRate);
             dm.dmFields |= Win32.DM_DISPLAYFREQUENCY;
         }
-
         int res = Win32.ChangeDisplaySettingsExW(deviceName, ref dm, IntPtr.Zero, Win32.CDS_UPDATEREGISTRY, IntPtr.Zero);
-        if (res != Win32.DISP_CHANGE_SUCCESSFUL)
-        {
-            Log.Warn($"ChangeDisplaySettingsEx({deviceName}, {pixelWidth}x{pixelHeight}) 返回 {res}");
-            return false;
-        }
-        return true;
-    }
-
-    public static bool TryAttachVirtualDisplay(int pixelWidth, int pixelHeight, int posX, int posY, out string? attachedDeviceName)
-    {
-        attachedDeviceName = null;
-        var dd = new Win32.DISPLAY_DEVICE { cb = (uint)Marshal.SizeOf<Win32.DISPLAY_DEVICE>() };
-        uint i = 0;
-        while (Win32.EnumDisplayDevicesW(null, i++, ref dd, 0))
-        {
-            string devName = new string(dd.DeviceName).TrimEnd('\0');
-            string devStr = new string(dd.DeviceString).TrimEnd('\0');
-            if (!devStr.Contains("Virtual Display", StringComparison.OrdinalIgnoreCase)) continue;
-            if ((dd.StateFlags & Win32.DISPLAY_DEVICE_ACTIVE) != 0) continue;
-
-            var mon = new Win32.DISPLAY_DEVICE { cb = (uint)Marshal.SizeOf<Win32.DISPLAY_DEVICE>() };
-            if (!Win32.EnumDisplayDevicesW(devName, 0, ref mon, 0)) continue;
-
-            string monStr = new string(mon.DeviceString).TrimEnd('\0');
-            Log.Info($"发现已到达但未启用的虚拟屏：{devName} ({monStr}, flags=0x{mon.StateFlags:X})，尝试扩展桌面...");
-
-            var dm = new Win32.DEVMODE
-            {
-                dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>(),
-                dmFields = Win32.DM_POSITION | Win32.DM_PELSWIDTH | Win32.DM_PELSHEIGHT | Win32.DM_BITSPERPEL | Win32.DM_DISPLAYFREQUENCY,
-                dmPositionX = posX,
-                dmPositionY = posY,
-                dmBitsPerPel = 32,
-                dmPelsWidth = (uint)pixelWidth,
-                dmPelsHeight = (uint)pixelHeight,
-                dmDisplayFrequency = 60
-            };
-
-            int r1 = Win32.ChangeDisplaySettingsExW(devName, ref dm, IntPtr.Zero, Win32.CDS_UPDATEREGISTRY | Win32.CDS_NORESET, IntPtr.Zero);
-            int r2 = Win32.ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-            Log.Info($"ChangeDisplaySettingsEx({devName}, {pixelWidth}x{pixelHeight}) => r1={r1}, r2={r2}");
-            if (r1 == Win32.DISP_CHANGE_SUCCESSFUL && r2 == Win32.DISP_CHANGE_SUCCESSFUL)
-            {
-                attachedDeviceName = devName;
-                return true;
-            }
-
-            int sdc = Win32.SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, Win32.SDC_APPLY | Win32.SDC_TOPOLOGY_EXTEND);
-            Log.Info($"SetDisplayConfig(SDC_TOPOLOGY_EXTEND) => {sdc}");
-            if (sdc == 0)
-            {
-                attachedDeviceName = devName;
-                return true;
-            }
-        }
+        if (res == Win32.DISP_CHANGE_SUCCESSFUL) return true;
+        Log.Warn($"ChangeDisplaySettingsEx({deviceName}, {pixelWidth}x{pixelHeight}) 返回 {res}");
         return false;
     }
+
+    internal static string? TryAttachVirtualDisplay(CherryMonitor target, int width, int height) =>
+        CcdTopology.Query(Win32.QDC_ALL_PATHS)?.Attach(target, width, height);
 
     public static bool HasDisplayMode(string deviceName, int pixelWidth, int pixelHeight)
     {
@@ -174,137 +137,50 @@ public static unsafe class DisplayConfigService
         return false;
     }
 
-    public static int GetDpiScalePercent(AdapterLuid adapterLuid, uint sourceId)
-    {
-        var adapterId = new Win32.LUID { LowPart = adapterLuid.LowPart, HighPart = adapterLuid.HighPart };
-        var pkt = new Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET
-        {
-            header = new Win32.DISPLAYCONFIG_DEVICE_INFO_HEADER
-            {
-                type = Win32.DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE,
-                size = (uint)Marshal.SizeOf<Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET>(),
-                adapterId = adapterId,
-                id = sourceId
-            }
-        };
-        if (Win32.DisplayConfigGetDeviceInfo(ref pkt) != 0) return 100;
+    public static int GetDpiScalePercent(AdapterLuid adapterLuid, uint sourceId) => ReadDpiScale(adapterLuid, sourceId)?.Current ?? 100;
 
-        int recommendedIdx = Math.Clamp(-pkt.minScaleRel, 0, DpiScaleTable.Length - 1);
-        int curIdx = Math.Clamp(recommendedIdx + pkt.curScaleRel, 0, DpiScaleTable.Length - 1);
-        return DpiScaleTable[curIdx];
+    private static (DpiScaleRange Range, int Current)? ReadDpiScale(AdapterLuid adapterLuid, uint sourceId)
+    {
+        var pkt = DpiQuery(adapterLuid, sourceId);
+        if (Win32.DisplayConfigGetDeviceInfo(ref pkt) != 0) return null;
+        var range = DpiScaleRange.FromRelative(pkt.minScaleRel, pkt.maxScaleRel);
+        return range?.PercentAt(pkt.curScaleRel) is { } current ? (range, current) : null;
     }
 
     public static bool SetDpiScalePercent(AdapterLuid adapterLuid, uint sourceId, int targetPercent)
     {
-        var adapterId = new Win32.LUID { LowPart = adapterLuid.LowPart, HighPart = adapterLuid.HighPart };
-        var getPkt = new Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET
-        {
-            header = new Win32.DISPLAYCONFIG_DEVICE_INFO_HEADER
-            {
-                type = Win32.DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE,
-                size = (uint)Marshal.SizeOf<Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET>(),
-                adapterId = adapterId,
-                id = sourceId
-            }
-        };
-        if (Win32.DisplayConfigGetDeviceInfo(ref getPkt) != 0)
-            return false;
-
-        int recommendedIdx = Math.Clamp(-getPkt.minScaleRel, 0, DpiScaleTable.Length - 1);
-        int targetIdx = Array.IndexOf(DpiScaleTable, targetPercent);
-        if (targetIdx < 0) return false;
-
-        int rel = Math.Clamp(targetIdx - recommendedIdx, getPkt.minScaleRel, getPkt.maxScaleRel);
-        if (rel == getPkt.curScaleRel) return true;
-
+        if (ReadDpiScale(adapterLuid, sourceId) is not { } scale) return false;
+        if (scale.Range.RelativeFor(targetPercent) is not { } rel) return false;
+        if (scale.Current == targetPercent) return true;
         var setPkt = new Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
         {
-            header = new Win32.DISPLAYCONFIG_DEVICE_INFO_HEADER
-            {
-                type = Win32.DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE,
+            header = new() { type = Win32.DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE,
                 size = (uint)Marshal.SizeOf<Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET>(),
-                adapterId = adapterId,
-                id = sourceId
-            },
+                adapterId = new() { LowPart = adapterLuid.LowPart, HighPart = adapterLuid.HighPart }, id = sourceId },
             scaleRel = rel
         };
         int status = Win32.DisplayConfigSetDeviceInfo(ref setPkt);
-        if (status != 0)
-        {
-            Log.Warn($"设置 DPI 缩放 {targetPercent}% 失败（status={status}）");
-            return false;
-        }
-        return true;
+        if (status != 0) Log.Warn($"设置 DPI 缩放 {targetPercent}% 失败（status={status}）");
+        return status == 0;
     }
 
-    private static Dictionary<string, string> QueryDeviceStrings()
+    private static Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET DpiQuery(AdapterLuid adapter, uint id) => new()
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        header = new()
+        {
+            type = Win32.DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE,
+            size = (uint)Marshal.SizeOf<Win32.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET>(),
+            adapterId = new() { LowPart = adapter.LowPart, HighPart = adapter.HighPart }, id = id
+        }
+    };
+
+    private static Dictionary<string, (string Desc, string Id)> QueryAdapters()
+    {
+        var map = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
         var dd = new Win32.DISPLAY_DEVICE { cb = (uint)Marshal.SizeOf<Win32.DISPLAY_DEVICE>() };
         uint i = 0;
         while (Win32.EnumDisplayDevicesW(null, i++, ref dd, 0))
-        {
-            string name = new string(dd.DeviceName).TrimEnd('\0');
-            string desc = new string(dd.DeviceString).TrimEnd('\0');
-            if (!string.IsNullOrEmpty(name))
-                map[name] = desc;
-        }
+            map[new string(dd.DeviceName)] = (new string(dd.DeviceString), new string(dd.DeviceID));
         return map;
-    }
-
-    private static Dictionary<string, (bool Found, Win32.LUID AdapterId, uint SourceId, string FriendlyName)> QueryCcdSources()
-    {
-        var map = new Dictionary<string, (bool, Win32.LUID, uint, string)>(StringComparer.OrdinalIgnoreCase);
-        if (Win32.GetDisplayConfigBufferSizes(Win32.QDC_ONLY_ACTIVE_PATHS, out uint pathCount, out uint modeCount) != 0)
-            return map;
-
-        var paths = new Win32.DISPLAYCONFIG_PATH_INFO[pathCount];
-        var modes = new Win32.DISPLAYCONFIG_MODE_INFO[modeCount];
-        if (Win32.QueryDisplayConfig(Win32.QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero) != 0)
-            return map;
-
-        for (int i = 0; i < pathCount; i++)
-        {
-            var p = paths[i];
-            var src = new Win32.DISPLAYCONFIG_SOURCE_DEVICE_NAME
-            {
-                header = new Win32.DISPLAYCONFIG_DEVICE_INFO_HEADER
-                {
-                    type = Win32.DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-                    size = (uint)Marshal.SizeOf<Win32.DISPLAYCONFIG_SOURCE_DEVICE_NAME>(),
-                    adapterId = p.sourceInfo.adapterId,
-                    id = p.sourceInfo.id
-                }
-            };
-            if (Win32.DisplayConfigGetDeviceInfo(ref src) != 0) continue;
-            string gdiName = new string(src.viewGdiDeviceName).TrimEnd('\0');
-            if (string.IsNullOrEmpty(gdiName)) continue;
-
-            var tgt = new Win32.DISPLAYCONFIG_TARGET_DEVICE_NAME
-            {
-                header = new Win32.DISPLAYCONFIG_DEVICE_INFO_HEADER
-                {
-                    type = Win32.DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-                    size = (uint)Marshal.SizeOf<Win32.DISPLAYCONFIG_TARGET_DEVICE_NAME>(),
-                    adapterId = p.targetInfo.adapterId,
-                    id = p.targetInfo.id
-                }
-            };
-            string friendly = Win32.DisplayConfigGetDeviceInfo(ref tgt) == 0
-                ? new string(tgt.monitorFriendlyDeviceName).TrimEnd('\0')
-                : gdiName;
-
-            if (!map.ContainsKey(gdiName))
-                map[gdiName] = (true, p.sourceInfo.adapterId, p.sourceInfo.id, friendly);
-        }
-
-        return map;
-    }
-
-    private static uint ComputeStableId(string devName, Win32.LUID adapterId, uint sourceId)
-    {
-        if (adapterId.LowPart != 0 || adapterId.HighPart != 0)
-            return (uint)HashCode.Combine(adapterId.LowPart, adapterId.HighPart, sourceId);
-        return (uint)StringComparer.OrdinalIgnoreCase.GetHashCode(devName);
     }
 }

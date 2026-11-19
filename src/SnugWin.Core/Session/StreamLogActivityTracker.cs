@@ -11,51 +11,54 @@ public sealed class StreamLogActivityTracker
     public static readonly TimeSpan AdvancePairMaxGap = TimeSpan.FromSeconds(3.0);
     public static readonly TimeSpan ActiveHoldWindow = TimeSpan.FromSeconds(2.0);
 
-    private int _serverPid;
-    private long _lastBytes = -1;
-    private DateTimeOffset _prevAdvance = DateTimeOffset.MinValue;
-    private DateTimeOffset _lastAdvance = DateTimeOffset.MinValue;
+    private int? _serverPid;
+    private long? _lastBytes;
+    private DateTimeOffset _lastReadAt;
+    private DateTimeOffset? _lastAdvance;
+    private bool _continuous;
 
     public void Reset()
     {
-        _serverPid = 0;
-        _lastBytes = -1;
-        _prevAdvance = DateTimeOffset.MinValue;
-        _lastAdvance = DateTimeOffset.MinValue;
+        _serverPid = null;
+        _lastBytes = null;
+        _lastReadAt = default;
+        _lastAdvance = null;
+        _continuous = false;
     }
 
-    public bool? Observe(int? serverPid, long? totalBytes, bool logFilesExist, DateTimeOffset now)
+    public bool? Observe(int? serverPid, long? totalBytes, bool logFilesExist, DateTimeOffset now, bool wasConnected = false)
     {
-        if (serverPid is not { } pid)
+        if (serverPid is null || !logFilesExist || totalBytes is not { } bytes)
         {
             Reset();
-            return false;
+            return serverPid is null ? false : null;
         }
 
-        if (pid != _serverPid)
-        {
+        if (serverPid != _serverPid || bytes < _lastBytes || now < _lastReadAt)
             Reset();
-            _serverPid = pid;
-        }
+        _serverPid = serverPid;
+        return ObserveBytes(bytes, now, wasConnected);
+    }
 
-        if (!logFilesExist || totalBytes is not { } bytes)
-            return null;
+    private bool? ObserveBytes(long bytes, DateTimeOffset now, bool wasConnected)
+    {
+        var previous = _lastBytes;
+        var sampleGap = now - _lastReadAt;
+        _lastBytes = bytes;
+        _lastReadAt = now;
+        if (previous is null || bytes == previous)
+            return _continuous && now - _lastAdvance < ActiveHoldWindow;
 
-        if (_lastBytes < 0)
+        if (sampleGap > AdvancePairMaxGap)
         {
-            _lastBytes = bytes;
-            return false;
+            // Growth somewhere in a missed interval can sustain a connection, but cannot prove a new one.
+            _continuous = wasConnected;
+            _lastAdvance = wasConnected ? now : null;
+            return wasConnected ? true : null;
         }
 
-        if (bytes > _lastBytes)
-        {
-            _lastBytes = bytes;
-            _prevAdvance = _lastAdvance;
-            _lastAdvance = now;
-        }
-
-        bool continuous = _prevAdvance != DateTimeOffset.MinValue
-                          && _lastAdvance - _prevAdvance <= AdvancePairMaxGap;
-        return continuous && now - _lastAdvance < ActiveHoldWindow;
+        _continuous = _lastAdvance is { } last && now - last <= AdvancePairMaxGap;
+        _lastAdvance = now;
+        return _continuous;
     }
 }

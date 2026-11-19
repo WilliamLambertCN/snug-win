@@ -56,7 +56,10 @@ public static unsafe partial class Win32
     public const int ENUM_CURRENT_SETTINGS = -1;
     public const int DISPLAY_DEVICE_ACTIVE = 0x00000001;
 
+    public const uint QDC_ALL_PATHS = 0x00000001;
     public const uint QDC_ONLY_ACTIVE_PATHS = 0x00000002;
+    public const uint DISPLAYCONFIG_PATH_ACTIVE = 1;
+    public const uint CR_NO_SUCH_DEVNODE = 0x0D;
     public const uint SDC_APPLY = 0x00000080;
     public const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
     public const uint SDC_ALLOW_CHANGES = 0x00000400;
@@ -639,6 +642,19 @@ public static unsafe partial class Win32
         uint numModeInfoArrayElements,
         IntPtr modeInfoArray,
         uint flags);
+
+    [DllImport("user32.dll")]
+    internal static extern int SetDisplayConfig(
+        uint pathCount, [In] DISPLAYCONFIG_PATH_INFO[] paths, uint modeCount, [In] DISPLAYCONFIG_MODE_INFO[] modes, uint flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    internal static extern uint CM_Locate_DevNodeW(out uint node, string instance, uint flags);
+
+    [DllImport("cfgmgr32.dll")]
+    internal static extern uint CM_Get_Parent(out uint parent, uint node, uint flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    internal static extern uint CM_Get_Device_IDW(uint node, StringBuilder buffer, uint length, uint flags);
 
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);

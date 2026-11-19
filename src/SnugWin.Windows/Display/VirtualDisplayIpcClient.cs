@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
@@ -12,15 +13,15 @@ using SnugWin.Core.Support;
 namespace SnugWin.Windows.Display;
 
 public sealed record VddMode(
-    [property: JsonPropertyName("width")] uint Width,
-    [property: JsonPropertyName("height")] uint Height,
-    [property: JsonPropertyName("refresh_rates")] IReadOnlyList<uint> RefreshRates);
+    [property: JsonPropertyName("width"), JsonRequired] uint Width,
+    [property: JsonPropertyName("height"), JsonRequired] uint Height,
+    [property: JsonPropertyName("refresh_rates"), JsonRequired] IReadOnlyList<uint> RefreshRates);
 
 public sealed record VddMonitor(
-    [property: JsonPropertyName("id")] uint Id,
+    [property: JsonPropertyName("id"), JsonRequired] uint Id,
     [property: JsonPropertyName("name")] string? Name,
-    [property: JsonPropertyName("enabled")] bool Enabled,
-    [property: JsonPropertyName("modes")] IReadOnlyList<VddMode> Modes);
+    [property: JsonPropertyName("enabled"), JsonRequired] bool Enabled,
+    [property: JsonPropertyName("modes"), JsonRequired] IReadOnlyList<VddMode> Modes);
 
 internal sealed record VddLegacyMode(
     [property: JsonPropertyName("width")] uint Width,
@@ -42,32 +43,38 @@ internal interface IVirtualDisplayIpc : IAsyncDisposable
 
 /// <summary>
 /// Named-pipe client supporting both:
-/// - virtual-display-rs master (InOut byte pipe, EOT 0x04 framing, Notify/Remove/RemoveAll)
+/// - virtual-display-rs master (InOut byte pipe, EOT 0x04 framing, State/Notify/Remove/RemoveAll)
 /// - virtual-display-rs v0.3.1 (Out write-only pipe, raw JSON message, Add/Remove/RemoveAll)
 /// </summary>
-public sealed class VirtualDisplayIpcClient : IVirtualDisplayIpc, IAsyncDisposable
+public sealed class VirtualDisplayIpcClient : IVirtualDisplayIpc, IVirtualDisplayState
 {
     public const string DefaultPipeName = "virtualdisplaydriver";
     public const byte Eot = 0x04;
+    private const int MaxFrameBytes = 1024 * 1024;
+    private static readonly TimeSpan IoTimeout = TimeSpan.FromSeconds(5);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        RespectNullableAnnotations = true,
+        AllowDuplicateProperties = false,
+        // A later Notify replaces every monitor; fields we cannot round-trip must not be discarded.
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
     };
 
     private readonly string _pipeName;
     private readonly SemaphoreSlim _ioGate = new(1, 1);
-    private NamedPipeClientStream? _v2Pipe;
-    private NamedPipeClientStream? _legacyPipe;
-    private bool? _isLegacyV031;
+    private CancellationTokenSource? _lifetime = new();
+    private NamedPipeClientStream? _pipe;
+    private V2Receiver? _receiver;
 
     public VirtualDisplayIpcClient(string pipeName = DefaultPipeName)
     {
         _pipeName = pipeName;
     }
 
-    public bool IsLegacyProtocol => _isLegacyV031 == true;
+    public bool IsLegacyProtocol => _pipe is { IsConnected: true, CanRead: false };
 
     public static bool IsDriverPipeAvailable(string pipeName = DefaultPipeName)
     {
@@ -81,85 +88,34 @@ public sealed class VirtualDisplayIpcClient : IVirtualDisplayIpc, IAsyncDisposab
         }
     }
 
-    public async Task NotifyAsync(IReadOnlyList<VddMonitor> monitors, CancellationToken ct = default)
+    public async Task<IReadOnlyList<VddMonitor>?> ReadStateAsync(CancellationToken ct = default)
     {
-        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
-        try
+        IReadOnlyList<VddMonitor>? state = null;
+        await WithPipeAsync(async (pipe, token) =>
         {
-            bool legacy = await EnsureProtocolAsync(ct).ConfigureAwait(false);
-            if (legacy)
-            {
-                await SendLegacyOneShotAsync(SerializeLegacyAdd(monitors), ct).ConfigureAwait(false);
-            }
-            else
-            {
-                await WriteV2FrameAsync(_v2Pipe!, SerializeNotify(monitors), ct).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            _ioGate.Release();
-        }
+            if (pipe.CanRead) state = await _receiver!.RequestStateAsync(token).ConfigureAwait(false);
+        }, ct).ConfigureAwait(false);
+        return state;
     }
 
-    public async Task ReplaceLegacyAsync(IReadOnlyList<uint> removeIds, IReadOnlyList<VddMonitor> addMonitors, CancellationToken ct = default)
-    {
-        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            bool legacy = await EnsureProtocolAsync(ct).ConfigureAwait(false);
-            if (legacy)
-            {
-                await SendLegacyOneShotAsync(SerializeRemove(removeIds), ct).ConfigureAwait(false);
-                await Task.Delay(120, ct).ConfigureAwait(false);
-                await SendLegacyOneShotAsync(SerializeLegacyAdd(addMonitors), ct).ConfigureAwait(false);
-            }
-            else
-            {
-                await WriteV2FrameAsync(_v2Pipe!, SerializeNotify(addMonitors), ct).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            _ioGate.Release();
-        }
-    }
+    public Task NotifyAsync(IReadOnlyList<VddMonitor> monitors, CancellationToken ct = default) =>
+        WithPipeAsync((pipe, token) => WriteCommandAsync(pipe,
+            pipe.CanRead ? SerializeNotify(monitors) : SerializeLegacyAdd(monitors), token), ct);
 
-    public async Task RemoveAsync(IReadOnlyList<uint> ids, CancellationToken ct = default)
-    {
-        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
-        try
+    public Task ReplaceLegacyAsync(IReadOnlyList<uint> removeIds, IReadOnlyList<VddMonitor> addMonitors, CancellationToken ct = default) =>
+        WithPipeAsync(async (pipe, token) =>
         {
-            bool legacy = await EnsureProtocolAsync(ct).ConfigureAwait(false);
-            string json = SerializeRemove(ids);
-            if (legacy)
-                await SendLegacyOneShotAsync(json, ct).ConfigureAwait(false);
-            else
-                await WriteV2FrameAsync(_v2Pipe!, json, ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _ioGate.Release();
-        }
-    }
+            if (pipe.CanRead) throw new NotSupportedException("v2 驱动不支持 legacy 局部替换，未发送显示配置");
+            await WriteCommandAsync(pipe, SerializeRemove(removeIds), token).ConfigureAwait(false);
+            await Task.Delay(120, token).ConfigureAwait(false);
+            await WriteCommandAsync(pipe, SerializeLegacyAdd(addMonitors), token).ConfigureAwait(false);
+        }, ct);
 
-    public async Task RemoveAllAsync(CancellationToken ct = default)
-    {
-        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            bool legacy = await EnsureProtocolAsync(ct).ConfigureAwait(false);
-            string json = SerializeRemoveAll();
-            if (legacy)
-                await SendLegacyOneShotAsync(json, ct).ConfigureAwait(false);
-            else
-                await WriteV2FrameAsync(_v2Pipe!, json, ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _ioGate.Release();
-        }
-    }
+    public Task RemoveAsync(IReadOnlyList<uint> ids, CancellationToken ct = default) =>
+        WithPipeAsync((pipe, token) => WriteCommandAsync(pipe, SerializeRemove(ids), token), ct);
+
+    public Task RemoveAllAsync(CancellationToken ct = default) =>
+        WithPipeAsync((pipe, token) => WriteCommandAsync(pipe, SerializeRemoveAll(), token), ct);
 
     public static string SerializeNotify(IReadOnlyList<VddMonitor> monitors) =>
         JsonSerializer.Serialize(new Dictionary<string, IReadOnlyList<VddMonitor>>
@@ -202,118 +158,202 @@ public sealed class VirtualDisplayIpcClient : IVirtualDisplayIpc, IAsyncDisposab
         try
         {
             using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
-            if (doc.RootElement.TryGetProperty("State", out var stateEl)
-                || doc.RootElement.TryGetProperty("Changed", out stateEl))
-            {
-                monitors = JsonSerializer.Deserialize<List<VddMonitor>>(stateEl.GetRawText(), JsonOptions)
-                           ?? new List<VddMonitor>();
-                return true;
-            }
-            return false;
+            IsStateFrame(doc.RootElement, out var payload);
+            monitors = ParseMonitors(payload);
+            return true;
         }
-        catch
+        catch (Exception ex) when (ex is JsonException or ArgumentException) { return false; }
+    }
+
+    private static bool IsStateFrame(JsonElement root, out JsonElement payload)
+    {
+        if (root.ValueKind != JsonValueKind.Object || root.GetPropertyCount() != 1)
+            throw new JsonException("Expected a single driver reply or event");
+        bool isState = root.TryGetProperty("State", out payload);
+        if ((!isState && !root.TryGetProperty("Changed", out payload)) || payload.ValueKind != JsonValueKind.Array)
+            throw new JsonException("Expected a State or Changed monitor list");
+        return isState;
+    }
+
+    private static IReadOnlyList<VddMonitor> ParseMonitors(JsonElement payload)
+    {
+        var monitors = payload.Deserialize<List<VddMonitor>>(JsonOptions)!;
+        if (monitors.Any(m => m is null || m.Modes.Any(mode => mode is null)))
+            throw new JsonException("Null monitor or mode in driver state");
+        return monitors;
+    }
+
+    private sealed class V2Receiver : IAsyncDisposable
+    {
+        private readonly NamedPipeClientStream _pipe;
+        private readonly CancellationTokenSource _stop = new();
+        private readonly Task _pump;
+        private TaskCompletionSource<IReadOnlyList<VddMonitor>>? _pending;
+        private TaskCompletionSource<IReadOnlyList<VddMonitor>>? _frameRecipient;
+
+        public V2Receiver(NamedPipeClientStream pipe)
         {
-            return false;
+            _pipe = pipe;
+            _pump = Task.Run(ReceiveAsync);
+        }
+
+        public async Task<IReadOnlyList<VddMonitor>> RequestStateAsync(CancellationToken ct)
+        {
+            var reply = new TaskCompletionSource<IReadOnlyList<VddMonitor>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // _ioGate permits one request; register before writing so a fast reply cannot be lost.
+            Volatile.Write(ref _pending, reply);
+            try
+            {
+                await WriteCommandAsync(_pipe, SerializeStateRequest(), ct).ConfigureAwait(false);
+                var first = await Task.WhenAny(reply.Task, _pump).WaitAsync(ct).ConfigureAwait(false);
+                if (first == _pump)
+                {
+                    await _pump.ConfigureAwait(false);
+                    throw new EndOfStreamException("虚拟显示器驱动管道已断开");
+                }
+                ct.ThrowIfCancellationRequested();
+                return await reply.Task.ConfigureAwait(false);
+            }
+            finally { Volatile.Write(ref _pending, null); }
+        }
+
+        private async Task ReceiveAsync()
+        {
+            var bytes = new byte[4096];
+            var frame = new ArrayBufferWriter<byte>();
+            try
+            {
+                while (true)
+                {
+                    int count = await _pipe.ReadAsync(bytes, _stop.Token).ConfigureAwait(false);
+                    if (count == 0) throw new EndOfStreamException("虚拟显示器驱动管道已断开");
+                    Consume(bytes.AsSpan(0, count), frame);
+                }
+            }
+            finally { _pipe.Dispose(); }
+        }
+
+        private void Consume(ReadOnlySpan<byte> bytes, ArrayBufferWriter<byte> frame)
+        {
+            var recipient = Volatile.Read(ref _pending);
+            while (!bytes.IsEmpty)
+            {
+                // A frame that started before this request cannot be its reply, even if EOT arrives later.
+                if (frame.WrittenCount == 0) _frameRecipient = recipient;
+                int eot = bytes.IndexOf(Eot);
+                int length = eot < 0 ? bytes.Length : eot;
+                if (frame.WrittenCount + length > MaxFrameBytes)
+                    throw new InvalidDataException("虚拟显示器驱动回复超过大小限制");
+                frame.Write(bytes[..length]);
+                if (eot < 0) return;
+                Dispatch(frame.WrittenMemory);
+                _frameRecipient = null;
+                frame.ResetWrittenCount();
+                bytes = bytes[(length + 1)..];
+            }
+        }
+
+        private void Dispatch(ReadOnlyMemory<byte> frame)
+        {
+            using var doc = JsonDocument.Parse(frame);
+            if (!IsStateFrame(doc.RootElement, out var payload)) return;
+            var state = ParseMonitors(payload);
+            _frameRecipient?.TrySetResult(state);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _stop.Cancel();
+            await _pump.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            _stop.Dispose();
         }
     }
 
-    private async Task<bool> EnsureProtocolAsync(CancellationToken ct)
+    private async Task WithPipeAsync(Func<NamedPipeClientStream, CancellationToken, Task> operation, CancellationToken ct)
     {
-        if (_isLegacyV031 == true)
-        {
-            if (_legacyPipe is not { IsConnected: true })
-            {
-                _legacyPipe?.Dispose();
-                var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.Out, PipeOptions.None);
-                await pipe.ConnectAsync(2500, ct).ConfigureAwait(false);
-                _legacyPipe = pipe;
-            }
-            return true;
-        }
-        if (_v2Pipe is { IsConnected: true }) return false;
-
-        _v2Pipe?.Dispose();
-        _v2Pipe = null;
-
+        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-            await pipe.ConnectAsync(1500, ct).ConfigureAwait(false);
-            _v2Pipe = pipe;
-            _isLegacyV031 = false;
-            return false;
+            var lifetime = Volatile.Read(ref _lifetime) ?? throw new ObjectDisposedException(nameof(VirtualDisplayIpcClient));
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, lifetime.Token);
+            deadline.CancelAfter(IoTimeout);
+            var pipe = await EnsureProtocolAsync(deadline.Token).ConfigureAwait(false);
+            await operation(pipe, deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not NotSupportedException)
+        {
+            // A late State has no request ID; stop the old reader before releasing the gate or reconnecting.
+            await DisconnectAsync().ConfigureAwait(false);
+            if (ex is OperationCanceledException)
+            {
+                ct.ThrowIfCancellationRequested();
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _lifetime) is null, this);
+                throw new TimeoutException("虚拟显示器驱动管道请求超时", ex);
+            }
+            if (ex is JsonException) throw new InvalidDataException("虚拟显示器驱动 IPC 消息格式无效", ex);
+            throw;
+        }
+        finally { _ioGate.Release(); }
+    }
+
+    private async Task<NamedPipeClientStream> EnsureProtocolAsync(CancellationToken ct)
+    {
+        if (_pipe is { IsConnected: true }) return _pipe;
+        await DisconnectAsync().ConfigureAwait(false);
+        try
+        {
+            _pipe = await ConnectAsync(PipeDirection.InOut, 1500, ct).ConfigureAwait(false);
+            _receiver = new V2Receiver(_pipe);
         }
         catch (UnauthorizedAccessException)
         {
-            // virtual-display-rs v0.3.1 creates server with PIPE_ACCESS_INBOUND, which rejects InOut
-            // and requires PipeDirection.Out (write-only). Keep this connected pipe open.
-            var legacy = new NamedPipeClientStream(".", _pipeName, PipeDirection.Out, PipeOptions.None);
-            await legacy.ConnectAsync(2500, ct).ConfigureAwait(false);
-            _legacyPipe = legacy;
-            _isLegacyV031 = true;
+            // Only access denial is evidence of a v0.3.1 inbound pipe, not a stalled v2 driver.
+            _pipe = await ConnectAsync(PipeDirection.Out, 2500, ct).ConfigureAwait(false);
             Log.Info("检测到 virtual-display-rs v0.3.x 写通道协议（PipeDirection.Out + Add）");
-            return true;
         }
+        return _pipe;
     }
 
-    private async Task SendLegacyOneShotAsync(string json, CancellationToken ct)
+    private async Task<NamedPipeClientStream> ConnectAsync(PipeDirection direction, int timeoutMs, CancellationToken ct)
     {
-        byte[] payload = Encoding.UTF8.GetBytes(json);
+        var pipe = new NamedPipeClientStream(".", _pipeName, direction, PipeOptions.Asynchronous);
         try
         {
-            if (_legacyPipe is not { IsConnected: true })
-            {
-                _legacyPipe?.Dispose();
-                var p = new NamedPipeClientStream(".", _pipeName, PipeDirection.Out, PipeOptions.None);
-                await p.ConnectAsync(2500, ct).ConfigureAwait(false);
-                _legacyPipe = p;
-            }
-            await _legacyPipe.WriteAsync(payload, ct).ConfigureAwait(false);
-            await _legacyPipe.FlushAsync(ct).ConfigureAwait(false);
+            await pipe.ConnectAsync(timeoutMs, ct).ConfigureAwait(false);
+            return pipe;
         }
         catch
         {
-            _legacyPipe?.Dispose();
-            _legacyPipe = null;
-            var p = new NamedPipeClientStream(".", _pipeName, PipeDirection.Out, PipeOptions.None);
-            await p.ConnectAsync(2500, ct).ConfigureAwait(false);
-            _legacyPipe = p;
-            await p.WriteAsync(payload, ct).ConfigureAwait(false);
-            await p.FlushAsync(ct).ConfigureAwait(false);
+            pipe.Dispose();
+            throw;
         }
     }
 
-    private static async Task WriteV2FrameAsync(NamedPipeClientStream pipe, string json, CancellationToken ct)
+    private static async Task WriteCommandAsync(NamedPipeClientStream pipe, string json, CancellationToken ct)
     {
-        byte[] payload = Encoding.UTF8.GetBytes(json);
-        byte[] frame = new byte[payload.Length + 1];
-        Buffer.BlockCopy(payload, 0, frame, 0, payload.Length);
-        frame[^1] = Eot;
-        await pipe.WriteAsync(frame, ct).ConfigureAwait(false);
+        byte[] payload = Encoding.UTF8.GetBytes(pipe.CanRead ? json + (char)Eot : json);
+        await pipe.WriteAsync(payload, ct).ConfigureAwait(false);
         await pipe.FlushAsync(ct).ConfigureAwait(false);
+    }
+
+    private async Task DisconnectAsync()
+    {
+        if (_receiver is not null) await _receiver.DisposeAsync().ConfigureAwait(false);
+        _receiver = null;
+        _pipe?.Dispose();
+        _pipe = null;
     }
 
     public async ValueTask DisposeAsync()
     {
+        var lifetime = Interlocked.Exchange(ref _lifetime, null);
+        lifetime?.Cancel();
         await _ioGate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            if (_v2Pipe is not null)
-            {
-                await _v2Pipe.DisposeAsync().ConfigureAwait(false);
-                _v2Pipe = null;
-            }
-            if (_legacyPipe is not null)
-            {
-                await _legacyPipe.DisposeAsync().ConfigureAwait(false);
-                _legacyPipe = null;
-            }
-        }
+        try { await DisconnectAsync().ConfigureAwait(false); }
         finally
         {
+            lifetime?.Dispose();
             _ioGate.Release();
-            _ioGate.Dispose();
         }
     }
 }
